@@ -137,7 +137,7 @@ async function handleEmbeddings (req, apiKey) {
   return new Response(body, fixCors(response));
 }
 
-const DEFAULT_MODEL = "gemini-1.5-pro-latest";
+const DEFAULT_MODEL = "gemini-2.0-flash";
 async function handleCompletions (req, apiKey) {
   let model = DEFAULT_MODEL;
   switch(true) {
@@ -147,6 +147,7 @@ async function handleCompletions (req, apiKey) {
       model = req.model.substring(7);
       break;
     case req.model.startsWith("gemini-"):
+    case req.model.startsWith("gemma-"):
     case req.model.startsWith("learnlm-"):
       model = req.model;
   }
@@ -346,33 +347,248 @@ const reasonsMap = { //https://ai.google.dev/api/rest/v1/GenerateContentResponse
   // :"function_call",
 };
 const SEP = "\n\n|>";
-const transformCandidates = (key, cand) => ({
-  index: cand.index || 0, // 0-index is absent in new -002 models response
-  [key]: {
-    role: "assistant",
-    content: cand.content?.parts.map(p => p.text).join(SEP) },
-  logprobs: null,
-  finish_reason: reasonsMap[cand.finishReason] || cand.finishReason,
-});
+const transformCandidates = (key, cand) => {
+  try {
+    // 安全检查
+    if (!cand) {
+      console.error("[ERROR] 候选项为空");
+      return {
+        index: 0,
+        [key]: {
+          role: "assistant",
+          content: "处理候选项时出错"
+        },
+        logprobs: null,
+        finish_reason: "error"
+      };
+    }
+
+    // 检查content和parts是否存在
+    let contentText = "";
+    if (cand.content && Array.isArray(cand.content.parts)) {
+      try {
+        contentText = cand.content.parts.map(p => p?.text || "").join(SEP);
+      } catch (err) {
+        console.error("[ERROR] 处理content.parts时出错:", err);
+        console.error("[DEBUG] content.parts内容:", JSON.stringify(cand.content.parts));
+        contentText = "内容处理出错";
+      }
+    } else if (cand.content) {
+      // content存在但parts不是数组
+      console.error("[ERROR] content.parts不是数组或不存在");
+      console.error("[DEBUG] content内容:", JSON.stringify(cand.content));
+      contentText = "API返回了不完整的内容";
+    } else {
+      // content不存在
+      console.error("[ERROR] 候选项缺少content字段");
+      console.error("[DEBUG] 候选项内容:", JSON.stringify(cand));
+      contentText = "无法获取内容";
+    }
+
+    return {
+      index: cand.index || 0, // 0-index is absent in new -002 models response
+      [key]: {
+        role: "assistant",
+        content: contentText
+      },
+      logprobs: null,
+      finish_reason: reasonsMap[cand.finishReason] || cand.finishReason || "error",
+    };
+  } catch (err) {
+    console.error("[ERROR] 转换候选项时发生错误:", err);
+    console.error("[DEBUG] 候选项内容:", JSON.stringify(cand));
+    return {
+      index: 0,
+      [key]: {
+        role: "assistant",
+        content: "转换候选项时出错"
+      },
+      logprobs: null,
+      finish_reason: "error"
+    };
+  }
+};
 const transformCandidatesMessage = transformCandidates.bind(null, "message");
 const transformCandidatesDelta = transformCandidates.bind(null, "delta");
 
-const transformUsage = (data) => ({
-  completion_tokens: data.candidatesTokenCount,
-  prompt_tokens: data.promptTokenCount,
-  total_tokens: data.totalTokenCount
-});
+const transformUsage = (data) => {
+  try {
+    if (!data) {
+      console.error("[ERROR] usageMetadata为空");
+      return {
+        completion_tokens: 0,
+        prompt_tokens: 0,
+        total_tokens: 0
+      };
+    }
+    
+    return {
+      completion_tokens: data.candidatesTokenCount || 0,
+      prompt_tokens: data.promptTokenCount || 0,
+      total_tokens: data.totalTokenCount || 0
+    };
+  } catch (err) {
+    console.error("[ERROR] 处理usageMetadata时出错:", err);
+    console.error("[DEBUG] usageMetadata内容:", JSON.stringify(data));
+    return {
+      completion_tokens: 0,
+      prompt_tokens: 0,
+      total_tokens: 0
+    };
+  }
+};
 
 const processCompletionsResponse = (data, model, id) => {
-  return JSON.stringify({
-    id,
-    choices: data.candidates.map(transformCandidatesMessage),
-    created: Math.floor(Date.now()/1000),
-    model,
-    //system_fingerprint: "fp_69829325d0",
-    object: "chat.completion",
-    usage: transformUsage(data.usageMetadata),
-  });
+  try {
+    // 对数据完整性进行详细检查
+    if (!data) {
+      console.error("[ERROR] Gemini API返回空数据");
+      console.error("[DEBUG] 完整响应:", JSON.stringify(data));
+      // 返回一个合理的空响应
+      return JSON.stringify({
+        id,
+        choices: [{
+          index: 0,
+          message: {
+            role: "assistant",
+            content: "抱歉，服务暂时无法提供回答。"
+          },
+          logprobs: null,
+          finish_reason: "error"
+        }],
+        created: Math.floor(Date.now()/1000),
+        model,
+        object: "chat.completion",
+        usage: { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 }
+      });
+    }
+    
+    // 检查candidates是否存在
+    if (!data.candidates) {
+      console.error("[ERROR] Gemini API返回的数据中缺少candidates字段");
+      console.error("[DEBUG] 完整响应:", JSON.stringify(data));
+      // 返回包含错误信息的响应
+      return JSON.stringify({
+        id,
+        choices: [{
+          index: 0,
+          message: {
+            role: "assistant",
+            content: "API服务返回了异常数据结构。"
+          },
+          logprobs: null,
+          finish_reason: "error"
+        }],
+        created: Math.floor(Date.now()/1000),
+        model,
+        object: "chat.completion",
+        usage: data.usageMetadata ? transformUsage(data.usageMetadata) : { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 }
+      });
+    }
+    
+    // 检查candidates是否为数组
+    if (!Array.isArray(data.candidates)) {
+      console.error("[ERROR] Gemini API返回的candidates不是数组");
+      console.error("[DEBUG] candidates类型:", typeof data.candidates);
+      console.error("[DEBUG] 完整响应:", JSON.stringify(data));
+      
+      // 尝试转换非数组的candidates为数组
+      const candidatesArray = [].concat(data.candidates).filter(Boolean);
+      
+      if (candidatesArray.length > 0) {
+        // 如果成功转换，继续使用转换后的数组
+        data.candidates = candidatesArray;
+      } else {
+        // 返回一个包含错误信息的响应
+        return JSON.stringify({
+          id,
+          choices: [{
+            index: 0,
+            message: {
+              role: "assistant",
+              content: "API服务返回了意外的数据格式。"
+            },
+            logprobs: null,
+            finish_reason: "error"
+          }],
+          created: Math.floor(Date.now()/1000),
+          model,
+          object: "chat.completion",
+          usage: data.usageMetadata ? transformUsage(data.usageMetadata) : { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 }
+        });
+      }
+    }
+    
+    // 检查candidates是否为空数组
+    if (data.candidates.length === 0) {
+      console.error("[ERROR] Gemini API返回的candidates是空数组");
+      console.error("[DEBUG] 完整响应:", JSON.stringify(data));
+      // 返回一个空的但有效的响应
+      return JSON.stringify({
+        id,
+        choices: [{
+          index: 0,
+          message: {
+            role: "assistant",
+            content: "API服务无法生成回答。"
+          },
+          logprobs: null,
+          finish_reason: "error"
+        }],
+        created: Math.floor(Date.now()/1000),
+        model,
+        object: "chat.completion",
+        usage: data.usageMetadata ? transformUsage(data.usageMetadata) : { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 }
+      });
+    }
+    
+    // 正常处理有效响应
+    return JSON.stringify({
+      id,
+      choices: data.candidates.map((cand, index) => {
+        try {
+          return transformCandidatesMessage(cand);
+        } catch (err) {
+          console.error(`[ERROR] 转换候选项 #${index} 时出错:`, err.message);
+          console.error("[DEBUG] 候选项内容:", JSON.stringify(cand));
+          // 返回一个安全的替代项
+          return {
+            index,
+            message: {
+              role: "assistant",
+              content: "内容处理出错，无法显示完整回答。"
+            },
+            logprobs: null,
+            finish_reason: "error"
+          };
+        }
+      }),
+      created: Math.floor(Date.now()/1000),
+      model,
+      object: "chat.completion",
+      usage: data.usageMetadata ? transformUsage(data.usageMetadata) : { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 }
+    });
+  } catch (error) {
+    console.error("[ERROR] 处理完成响应时发生错误:", error);
+    console.error("[DEBUG] 尝试处理的数据:", JSON.stringify(data));
+    // 即使在处理函数发生错误时也能返回有效响应
+    return JSON.stringify({
+      id,
+      choices: [{
+        index: 0,
+        message: {
+          role: "assistant",
+          content: "处理响应时发生内部错误。"
+        },
+        logprobs: null,
+        finish_reason: "error"
+      }],
+      created: Math.floor(Date.now()/1000),
+      model,
+      object: "chat.completion",
+      usage: { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 }
+    });
+  }
 };
 
 const responseLineRE = /^data: (.*)(?:\n\n|\r\r|\r\n\r\n)/;
@@ -416,29 +632,84 @@ async function toOpenAiStream (chunk, controller) {
   const transform = transformResponseStream.bind(this);
   const line = await chunk;
   if (!line) { return; }
+  
   let data;
   try {
     data = JSON.parse(line);
   } catch (err) {
-    console.error(line);
-    console.error(err);
+    console.error("[ERROR] 解析流数据行失败:", err);
+    console.error("[DEBUG] 原始行数据:", line);
+    
+    // 创建一个表示错误的候选项
     const length = this.last.length || 1; // at least 1 error msg
     const candidates = Array.from({ length }, (_, index) => ({
       finishReason: "error",
-      content: { parts: [{ text: err }] },
+      content: { parts: [{ text: "解析流响应时出错" }] },
       index,
     }));
     data = { candidates };
   }
-  const cand = data.candidates[0];
-  console.assert(data.candidates.length === 1, "Unexpected candidates count: %d", data.candidates.length);
-  cand.index = cand.index || 0; // absent in new -002 models response
-  if (!this.last[cand.index]) {
-    controller.enqueue(transform(data, false, "first"));
+  
+  // 检查candidates是否存在且为数组
+  if (!data.candidates || !Array.isArray(data.candidates)) {
+    console.error("[ERROR] 流响应中缺少candidates数组或格式不正确");
+    console.error("[DEBUG] 响应数据:", JSON.stringify(data));
+    
+    // 创建一个有效的candidates数组
+    data.candidates = [{
+      finishReason: "error",
+      content: { parts: [{ text: "API返回了异常数据结构" }] },
+      index: 0,
+    }];
   }
-  this.last[cand.index] = data;
-  if (cand.content) { // prevent empty data (e.g. when MAX_TOKENS)
-    controller.enqueue(transform(data));
+  
+  // 检查candidates是否为空数组
+  if (data.candidates.length === 0) {
+    console.error("[ERROR] 流响应中candidates是空数组");
+    console.error("[DEBUG] 响应数据:", JSON.stringify(data));
+    
+    // 添加一个默认候选项
+    data.candidates = [{
+      finishReason: "error",
+      content: { parts: [{ text: "API返回了空的候选项列表" }] },
+      index: 0,
+    }];
+  }
+  
+  try {
+    const cand = data.candidates[0];
+    
+    // 确保index存在
+    cand.index = cand.index || 0; // absent in new -002 models response
+    
+    if (!this.last[cand.index]) {
+      controller.enqueue(transform(data, false, "first"));
+    }
+    
+    this.last[cand.index] = data;
+    
+    // 检查content是否存在
+    if (cand.content) {
+      controller.enqueue(transform(data));
+    } else {
+      console.error("[ERROR] 候选项缺少content字段");
+      console.error("[DEBUG] 候选项内容:", JSON.stringify(cand));
+      // 不发送空内容，但保留在last中以便在flush时正确处理
+    }
+  } catch (err) {
+    console.error("[ERROR] 处理流数据时出错:", err);
+    console.error("[DEBUG] 尝试处理的数据:", JSON.stringify(data));
+    
+    // 替换为错误候选项
+    const errorData = {
+      candidates: [{
+        finishReason: "error",
+        content: { parts: [{ text: "处理流数据时出错" }] },
+        index: 0,
+      }]
+    };
+    this.last = [errorData];
+    controller.enqueue(transform(errorData, false, "first"));
   }
 }
 async function toOpenAiStreamFlush (controller) {
