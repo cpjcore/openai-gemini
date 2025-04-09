@@ -151,10 +151,6 @@ async function handleCompletions (req, apiKey) {
     case req.model.startsWith("learnlm-"):
       model = req.model;
   }
-  
-  // 判断是否为ping请求
-  const isPingRequest = isPingMessage(req);
-  
   const TASK = req.stream ? "streamGenerateContent" : "generateContent";
   let url = `${BASE_URL}/${API_VERSION}/models/${model}:${TASK}`;
   if (req.stream) { url += "?alt=sse"; }
@@ -184,26 +180,10 @@ async function handleCompletions (req, apiKey) {
         .pipeThrough(new TextEncoderStream());
     } else {
       body = await response.text();
-      body = processCompletionsResponse(JSON.parse(body), model, id, isPingRequest, req);
+      body = processCompletionsResponse(JSON.parse(body), model, id);
     }
   }
   return new Response(body, fixCors(response));
-}
-
-// 判断是否为ping消息的辅助函数
-function isPingMessage(req) {
-  // 检查消息内容是否为ping
-  const isContentPing = req.messages && 
-                       req.messages.length === 1 && 
-                       req.messages[0].content && 
-                       (typeof req.messages[0].content === 'string' ? 
-                         req.messages[0].content.trim().toLowerCase() === 'ping' : 
-                         (req.messages[0].content[0]?.text?.trim().toLowerCase() === 'ping'));
-  
-  // 检查max_tokens是否特别小（小于等于10）
-  const hasSmallMaxTokens = req.max_tokens && req.max_tokens <= 10;
-  
-  return isContentPing || hasSmallMaxTokens;
 }
 
 const harmCategory = [
@@ -371,9 +351,9 @@ const transformCandidates = (key, cand) => ({
   index: cand.index || 0, // 0-index is absent in new -002 models response
   [key]: {
     role: "assistant",
-    content: cand.content?.parts?.map(p => p?.text || "").join(SEP) || "" },
+    content: cand.content?.parts.map(p => p.text).join(SEP) },
   logprobs: null,
-  finish_reason: reasonsMap[cand.finishReason] || cand.finishReason || "unknown",
+  finish_reason: reasonsMap[cand.finishReason] || cand.finishReason,
 });
 const transformCandidatesMessage = transformCandidates.bind(null, "message");
 const transformCandidatesDelta = transformCandidates.bind(null, "delta");
@@ -384,105 +364,16 @@ const transformUsage = (data) => ({
   total_tokens: data.totalTokenCount
 });
 
-const processCompletionsResponse = (data, model, id, isPingRequest, req) => {
-  // 处理ping请求或candidates为空的情况
-  if (isPingRequest || !data.candidates || data.candidates.length === 0) {
-    if (isPingRequest) {
-      console.error("Ping request detected:", req.messages);
-    } else {
-      console.error("Empty candidates array in non-SSE response:", data);
-      
-      // 对于非ping请求的空candidates，返回错误信息
-      if (!isPingRequest) {
-        const errorInfo = {
-          error: {
-            message: "Empty candidates array in response",
-            type: "empty_candidates",
-            original_response: data
-          }
-        };
-        
-        return JSON.stringify({
-          id,
-          choices: [{
-            index: 0,
-            message: {
-              role: "assistant",
-              content: `[GEMINI_ERROR_INFO]${JSON.stringify(errorInfo)}[/GEMINI_ERROR_INFO]`
-            },
-            logprobs: null,
-            finish_reason: "error"
-          }],
-          created: Math.floor(Date.now()/1000),
-          model,
-          object: "chat.completion",
-          usage: data.usageMetadata ? transformUsage(data.usageMetadata) : {
-            completion_tokens: 0,
-            prompt_tokens: data.promptTokenCount || (req.messages?.length || 1),
-            total_tokens: data.promptTokenCount || (req.messages?.length || 1)
-          }
-        });
-      }
-    }
-    
-    // 返回一个有效的响应而不是报错
-    return JSON.stringify({
-      id,
-      choices: [{
-        index: 0,
-        message: {
-          role: "assistant",
-          content: isPingRequest ? "pong" : ""
-        },
-        logprobs: null,
-        finish_reason: data.promptFeedback?.blockReason || "stop"
-      }],
-      created: Math.floor(Date.now()/1000),
-      model,
-      object: "chat.completion",
-      usage: data.usageMetadata ? transformUsage(data.usageMetadata) : {
-        completion_tokens: isPingRequest ? 1 : 0,
-        prompt_tokens: data.promptTokenCount || (req.messages?.length || 1),
-        total_tokens: data.promptTokenCount ? (data.promptTokenCount + (isPingRequest ? 1 : 0)) : (req.messages?.length || 1) + (isPingRequest ? 1 : 0)
-      }
-    });
-  }
-  
-  // 检查是否有安全过滤
-  if (data.promptFeedback && data.promptFeedback.blockReason === "SAFETY") {
-    const safetyInfo = {
-      error: {
-        message: "Content blocked due to safety concerns",
-        type: "safety_filter",
-        details: data.promptFeedback
-      }
-    };
-    
-    return JSON.stringify({
-      id,
-      choices: [{
-        index: 0,
-        message: {
-          role: "assistant",
-          content: `[GEMINI_SAFETY_INFO]${JSON.stringify(safetyInfo)}[/GEMINI_SAFETY_INFO]`
-        },
-        logprobs: null,
-        finish_reason: "content_filter"
-      }],
-      created: Math.floor(Date.now()/1000),
-      model,
-      object: "chat.completion",
-      usage: data.usageMetadata ? transformUsage(data.usageMetadata) : {
-        completion_tokens: 0,
-        prompt_tokens: data.promptTokenCount || (req.messages?.length || 1),
-        total_tokens: data.promptTokenCount || (req.messages?.length || 1)
-      }
-    });
-  }
+const processCompletionsResponse = (data, model, id) => {
+  // 处理空candidates数组的情况，特别是对于ping请求或max_tokens很小的情况
+  const isPingRequest = data.promptFeedback?.promptTokenCount > 0 && 
+    (!data.candidates || data.candidates.length === 0);
   
   return JSON.stringify({
     id,
-    choices: data.candidates.map(transformCandidatesMessage),
+    choices: data.candidates && data.candidates.length > 0 
+      ? data.candidates.map(transformCandidatesMessage)
+      : [{ index: 0, message: { role: "assistant", content: "" }, logprobs: null, finish_reason: "length" }],
     created: Math.floor(Date.now()/1000),
     model,
     //system_fingerprint: "fp_69829325d0",
@@ -511,23 +402,6 @@ async function parseStreamFlush (controller) {
 }
 
 function transformResponseStream (data, stop, first) {
-  // 添加安全检查
-  if (!data || !data.candidates || !data.candidates.length) {
-    console.error("Invalid data for stream transformation:", data);
-    // 创建一个最小有效的响应
-    return "data: " + JSON.stringify({
-      id: this.id,
-      choices: [{
-        index: 0,
-        delta: { content: "" },
-        finish_reason: stop ? "stop" : null
-      }],
-      created: Math.floor(Date.now()/1000),
-      model: this.model,
-      object: "chat.completion.chunk",
-    }) + delimiter;
-  }
-
   const item = transformCandidatesDelta(data.candidates[0]);
   if (stop) { item.delta = {}; } else { item.finish_reason = null; }
   if (first) { item.delta.content = ""; } else { delete item.delta.role; }
@@ -555,75 +429,17 @@ async function toOpenAiStream (chunk, controller) {
   } catch (err) {
     console.error(line);
     console.error(err);
-    
-    // 返回特殊错误文本包含原始内容
-    const errorInfo = {
-      error: {
-        message: `Error parsing JSON: ${err.message}`,
-        type: "json_parse_error",
-        original_content: line
-      }
-    };
-    
-    const errorMessage = `[GEMINI_ERROR_INFO]${JSON.stringify(errorInfo)}[/GEMINI_ERROR_INFO]`;
-    const candidates = [{
+    const length = this.last.length || 1; // at least 1 error msg
+    const candidates = Array.from({ length }, (_, index) => ({
       finishReason: "error",
-      content: { parts: [{ text: errorMessage }] },
-      index: 0,
-    }];
+      content: { parts: [{ text: err }] },
+      index,
+    }));
     data = { candidates };
   }
-  
-  // 处理candidates为空的情况
-  if (!data.candidates || data.candidates.length === 0) {
-    console.error("Empty candidates array in SSE response:", data);
-    
-    // 返回特殊错误文本包含原始内容
-    const errorInfo = {
-      error: {
-        message: "Empty candidates array in response",
-        type: "empty_candidates",
-        original_response: data
-      }
-    };
-    
-    const errorMessage = `[GEMINI_ERROR_INFO]${JSON.stringify(errorInfo)}[/GEMINI_ERROR_INFO]`;
-    
-    // 创建带错误信息的候选项
-    data.candidates = [{
-      finishReason: "error",
-      content: { parts: [{ text: errorMessage }] },
-      index: 0,
-    }];
-    
-    // 在控制台记录提示反馈
-    if (data.promptFeedback) {
-      console.error("Prompt feedback:", data.promptFeedback);
-    }
-  }
-  
   const cand = data.candidates[0];
+  console.assert(data.candidates.length === 1, "Unexpected candidates count: %d", data.candidates.length);
   cand.index = cand.index || 0; // absent in new -002 models response
-  
-  // 检查finishReason
-  if (cand.finishReason === "SAFETY") {
-    console.error("Content blocked due to safety concerns", data);
-    
-    // 添加安全过滤特殊标记
-    if (cand.content && cand.content.parts && cand.content.parts.length > 0) {
-      const safetyInfo = {
-        error: {
-          message: "Content blocked due to safety concerns",
-          type: "safety_filter",
-          details: data.promptFeedback || {}
-        }
-      };
-      
-      const safetyMessage = `[GEMINI_SAFETY_INFO]${JSON.stringify(safetyInfo)}[/GEMINI_SAFETY_INFO]`;
-      cand.content.parts[0].text = safetyMessage + (cand.content.parts[0].text || "");
-    }
-  }
-  
   if (!this.last[cand.index]) {
     controller.enqueue(transform(data, false, "first"));
   }
