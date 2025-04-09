@@ -151,6 +151,10 @@ async function handleCompletions (req, apiKey) {
     case req.model.startsWith("learnlm-"):
       model = req.model;
   }
+  
+  // 判断是否为ping请求
+  const isPingRequest = isPingMessage(req);
+  
   const TASK = req.stream ? "streamGenerateContent" : "generateContent";
   let url = `${BASE_URL}/${API_VERSION}/models/${model}:${TASK}`;
   if (req.stream) { url += "?alt=sse"; }
@@ -175,17 +179,31 @@ async function handleCompletions (req, apiKey) {
           transform: toOpenAiStream,
           flush: toOpenAiStreamFlush,
           streamIncludeUsage: req.stream_options?.include_usage,
-          model, id,
-          last: [],
-          lastReceivedData: null
+          model, id, last: [],
         }))
         .pipeThrough(new TextEncoderStream());
     } else {
       body = await response.text();
-      body = processCompletionsResponse(JSON.parse(body), model, id);
+      body = processCompletionsResponse(JSON.parse(body), model, id, isPingRequest, req);
     }
   }
   return new Response(body, fixCors(response));
+}
+
+// 判断是否为ping消息的辅助函数
+function isPingMessage(req) {
+  // 检查消息内容是否为ping
+  const isContentPing = req.messages && 
+                       req.messages.length === 1 && 
+                       req.messages[0].content && 
+                       (typeof req.messages[0].content === 'string' ? 
+                         req.messages[0].content.trim().toLowerCase() === 'ping' : 
+                         (req.messages[0].content[0]?.text?.trim().toLowerCase() === 'ping'));
+  
+  // 检查max_tokens是否特别小（小于等于10）
+  const hasSmallMaxTokens = req.max_tokens && req.max_tokens <= 10;
+  
+  return isContentPing || hasSmallMaxTokens;
 }
 
 const harmCategory = [
@@ -353,9 +371,9 @@ const transformCandidates = (key, cand) => ({
   index: cand.index || 0, // 0-index is absent in new -002 models response
   [key]: {
     role: "assistant",
-    content: cand.content?.parts.map(p => p.text).join(SEP) },
+    content: cand.content?.parts?.map(p => p?.text || "").join(SEP) || "" },
   logprobs: null,
-  finish_reason: reasonsMap[cand.finishReason] || cand.finishReason,
+  finish_reason: reasonsMap[cand.finishReason] || cand.finishReason || "unknown",
 });
 const transformCandidatesMessage = transformCandidates.bind(null, "message");
 const transformCandidatesDelta = transformCandidates.bind(null, "delta");
@@ -366,40 +384,46 @@ const transformUsage = (data) => ({
   total_tokens: data.totalTokenCount
 });
 
-const processCompletionsResponse = (data, model, id) => {
-  // Default empty choices and null usage
-  let choices = [];
-  let usage = null;
-
-  // Safely process candidates if the array exists
-  if (data && Array.isArray(data.candidates)) {
-    choices = data.candidates.map(transformCandidatesMessage);
-  } else {
-    console.warn("processCompletionsResponse: Received non-streaming response without a valid 'candidates' array.", data);
-    // Decide how to represent this: maybe an empty choices array is sufficient,
-    // or perhaps add an error object to the response if appropriate.
-    // For a "ping" that might just return feedback, empty choices is likely okay.
-  }
-
-  // Safely process usageMetadata if it exists
-  if (data && data.usageMetadata) {
-    try {
-        usage = transformUsage(data.usageMetadata);
-    } catch (usageError) {
-        console.error("Error transforming usage metadata:", usageError, data.usageMetadata);
-        // Keep usage as null if transformation fails
+const processCompletionsResponse = (data, model, id, isPingRequest, req) => {
+  // 处理ping请求或candidates为空的情况
+  if (isPingRequest || !data.candidates || data.candidates.length === 0) {
+    if (isPingRequest) {
+      console.error("Ping request detected:", req.messages);
+    } else {
+      console.error("Empty candidates array in non-SSE response:", data);
     }
-  } else {
-      console.warn("processCompletionsResponse: Received non-streaming response without 'usageMetadata'.", data);
+    
+    // 返回一个有效的响应而不是报错
+    return JSON.stringify({
+      id,
+      choices: [{
+        index: 0,
+        message: {
+          role: "assistant",
+          content: isPingRequest ? "pong" : ""
+        },
+        logprobs: null,
+        finish_reason: data.promptFeedback?.blockReason || "stop"
+      }],
+      created: Math.floor(Date.now()/1000),
+      model,
+      object: "chat.completion",
+      usage: data.usageMetadata ? transformUsage(data.usageMetadata) : {
+        completion_tokens: isPingRequest ? 1 : 0,
+        prompt_tokens: data.promptTokenCount || (req.messages?.length || 1),
+        total_tokens: data.promptTokenCount ? (data.promptTokenCount + (isPingRequest ? 1 : 0)) : (req.messages?.length || 1) + (isPingRequest ? 1 : 0)
+      }
+    });
   }
-
+  
   return JSON.stringify({
     id,
-    choices, // Use the safely processed choices
+    choices: data.candidates.map(transformCandidatesMessage),
     created: Math.floor(Date.now()/1000),
     model,
+    //system_fingerprint: "fp_69829325d0",
     object: "chat.completion",
-    usage, // Use the safely processed usage
+    usage: transformUsage(data.usageMetadata),
   });
 };
 
@@ -423,46 +447,37 @@ async function parseStreamFlush (controller) {
 }
 
 function transformResponseStream (data, stop, first) {
-  if (!data || !data.candidates || !Array.isArray(data.candidates) || data.candidates.length === 0) {
-      console.error("transformResponseStream called with invalid data:", data);
-      return null;
+  // 添加安全检查
+  if (!data || !data.candidates || !data.candidates.length) {
+    console.error("Invalid data for stream transformation:", data);
+    // 创建一个最小有效的响应
+    return "data: " + JSON.stringify({
+      id: this.id,
+      choices: [{
+        index: 0,
+        delta: { content: "" },
+        finish_reason: stop ? "stop" : null
+      }],
+      created: Math.floor(Date.now()/1000),
+      model: this.model,
+      object: "chat.completion.chunk",
+    }) + delimiter;
   }
 
-  const cand = data.candidates[0];
-  const item = transformCandidatesDelta(cand);
-
-  if (stop) {
-      item.delta = {};
-      item.finish_reason = reasonsMap[cand.finishReason] || cand.finishReason || "stop";
-  } else {
-      item.finish_reason = null;
-  }
-
-  if (first) {
-      item.delta = item.delta || {};
-      item.delta.role = "assistant";
-      item.delta.content = "";
-  } else {
-      if (item.delta) {
-          delete item.delta.role;
-      }
-  }
-
-  const choiceItem = {
-      index: item.index || 0,
-      delta: item.delta || {},
-      logprobs: item.logprobs,
-      finish_reason: item.finish_reason,
-  };
-
+  const item = transformCandidatesDelta(data.candidates[0]);
+  if (stop) { item.delta = {}; } else { item.finish_reason = null; }
+  if (first) { item.delta.content = ""; } else { delete item.delta.role; }
   const output = {
     id: this.id,
-    choices: [choiceItem],
+    choices: [item],
     created: Math.floor(Date.now()/1000),
     model: this.model,
+    //system_fingerprint: "fp_69829325d0",
     object: "chat.completion.chunk",
   };
-
+  if (data.usageMetadata && this.streamIncludeUsage) {
+    output.usage = stop ? transformUsage(data.usageMetadata) : null;
+  }
   return "data: " + JSON.stringify(output) + delimiter;
 }
 const delimiter = "\n\n";
@@ -473,132 +488,53 @@ async function toOpenAiStream (chunk, controller) {
   let data;
   try {
     data = JSON.parse(line);
-    this.lastReceivedData = data;
   } catch (err) {
-    console.error("Error parsing SSE line:", line, err);
-    const errorOutput = {
-      id: this.id,
-      choices: [{
-        index: 0,
-        delta: { role: "assistant", content: `
-
-[Error parsing stream data: ${err.message}]` },
-        logprobs: null,
-        finish_reason: "error"
-      }],
-      created: Math.floor(Date.now()/1000),
-      model: this.model,
-      object: "chat.completion.chunk",
-    };
-    controller.enqueue("data: " + JSON.stringify(errorOutput) + delimiter);
-    return;
+    console.error(line);
+    console.error(err);
+    const length = this.last.length || 1; // at least 1 error msg
+    const candidates = Array.from({ length }, (_, index) => ({
+      finishReason: "error",
+      content: { parts: [{ text: err }] },
+      index,
+    }));
+    data = { candidates };
   }
-
-  if (data.promptFeedback) {
-    console.warn("Received promptFeedback:", JSON.stringify(data.promptFeedback));
+  
+  // 处理candidates为空的情况
+  if (!data.candidates || data.candidates.length === 0) {
+    console.error("Empty candidates array in SSE response:", data);
+    // 跳过这个空的数据块，但记录下可能存在的提示反馈或安全信息
+    if (data.promptFeedback) {
+      console.error("Prompt feedback:", data.promptFeedback);
+    }
+    return; // 跳过这个空的数据块
   }
-
-  if (data.candidates && Array.isArray(data.candidates) && data.candidates.length > 0) {
-    const cand = data.candidates[0];
-    cand.index = cand.index || 0;
-
-    if (!this.last[cand.index]) {
-       const firstChunkStr = transform(data, false, "first");
-       if (firstChunkStr) controller.enqueue(firstChunkStr);
-    }
-
-    this.last[cand.index] = data;
-
-    if (cand.content && cand.content.parts && cand.content.parts.length > 0) {
-        const textContent = cand.content.parts.map(p => p.text).filter(Boolean).join("");
-        if (textContent) {
-           const contentChunkStr = transform(data);
-           if (contentChunkStr) controller.enqueue(contentChunkStr);
-        } else {
-           console.log("Received chunk with empty content parts for index:", cand.index);
-        }
-    } else if (cand.finishReason) {
-        console.log("Received chunk with finishReason for index:", cand.index, cand.finishReason);
-    } else {
-        console.log("Received chunk with candidate but no content/finishReason for index:", cand.index);
-    }
-
-  } else {
-    console.log("Received SSE chunk with empty or missing candidates array:", line);
+  
+  const cand = data.candidates[0];
+  console.assert(data.candidates.length === 1, "Unexpected candidates count: %d", data.candidates.length);
+  cand.index = cand.index || 0; // absent in new -002 models response
+  
+  // 检查finishReason
+  if (cand.finishReason === "SAFETY") {
+    console.error("Content blocked due to safety concerns", data);
+    // 可选：发送一个特殊的消息告知用户内容被安全过滤
+    // 这里保留原有行为，处理安全过滤的内容
+  }
+  
+  if (!this.last[cand.index]) {
+    controller.enqueue(transform(data, false, "first"));
+  }
+  this.last[cand.index] = data;
+  if (cand.content) { // prevent empty data (e.g. when MAX_TOKENS)
+    controller.enqueue(transform(data));
   }
 }
 async function toOpenAiStreamFlush (controller) {
   const transform = transformResponseStream.bind(this);
-  let finalUsage = null;
-  let sentFinalChunk = false;
-
-  if (this.lastReceivedData?.usageMetadata && this.streamIncludeUsage) {
-      finalUsage = transformUsage(this.lastReceivedData.usageMetadata);
-      console.log("Captured final usage metadata from the last received chunk:", JSON.stringify(finalUsage));
-  }
-
   if (this.last.length > 0) {
-    for (let i = 0; i < this.last.length; i++) {
-        const data = this.last[i];
-        if (data) {
-            const finalChunkStrBase = transform(data, "stop");
-
-            if (finalChunkStrBase) {
-                let finalChunkStrToEnqueue = finalChunkStrBase;
-                if (i === this.last.length - 1 && finalUsage) {
-                    try {
-                        const outputJson = JSON.parse(finalChunkStrBase.substring(6));
-                        outputJson.usage = finalUsage;
-                        finalChunkStrToEnqueue = "data: " + JSON.stringify(outputJson) + delimiter;
-                        console.log("Injected final usage into the last candidate's final chunk.");
-                    } catch (e) {
-                        console.error("Error injecting final usage into last chunk:", e);
-                    }
-                }
-                controller.enqueue(finalChunkStrToEnqueue);
-                sentFinalChunk = true;
-            } else {
-                 console.log(`Failed to transform final data for candidate index ${i}, skipping.`);
-            }
-        } else {
-          console.log(`No final data stored for candidate index ${i}, skipping.`);
-        }
+    for (const data of this.last) {
+      controller.enqueue(transform(data, "stop"));
     }
+    controller.enqueue("data: [DONE]" + delimiter);
   }
-
-  if (!sentFinalChunk && this.lastReceivedData) {
-      console.warn("Stream ended, but no candidate data was ever processed. Constructing final chunk from last received data.");
-
-      let finishReason = "unknown";
-      let blockReasonDetails = null;
-
-      if (this.lastReceivedData.promptFeedback?.blockReason) {
-          finishReason = "content_filter";
-          blockReasonDetails = this.lastReceivedData.promptFeedback.blockReason;
-          console.warn("Detected blockReason in promptFeedback:", blockReasonDetails);
-      } else {
-          console.warn("Could not determine specific finish reason when no candidates were received.");
-          finishReason = "error";
-      }
-
-      const finalChoice = {
-          index: 0,
-          delta: {},
-          logprobs: null,
-          finish_reason: finishReason,
-      };
-
-      const finalOutput = {
-          id: this.id,
-          choices: [finalChoice],
-          created: Math.floor(Date.now()/1000),
-          model: this.model,
-          object: "chat.completion.chunk",
-          usage: finalUsage,
-      };
-      controller.enqueue("data: " + JSON.stringify(finalOutput) + delimiter);
-      sentFinalChunk = true;
-  }
-
-  controller.enqueue("data: [DONE]" + delimiter);
 }
