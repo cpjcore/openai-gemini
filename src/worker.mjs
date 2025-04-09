@@ -154,15 +154,78 @@ async function handleCompletions (req, apiKey) {
   const TASK = req.stream ? "streamGenerateContent" : "generateContent";
   let url = `${BASE_URL}/${API_VERSION}/models/${model}:${TASK}`;
   if (req.stream) { url += "?alt=sse"; }
-  const response = await fetch(url, {
-    method: "POST",
-    headers: makeHeaders(apiKey, { "Content-Type": "application/json" }),
-    body: JSON.stringify(await transformRequest(req)), // try
-  });
+  
+  try {
+    const response = await fetch(url, {
+      method: "POST",
+      headers: makeHeaders(apiKey, { "Content-Type": "application/json" }),
+      body: JSON.stringify(await transformRequest(req)),
+    });
 
-  let body = response.body;
-  if (response.ok) {
-    let id = generateChatcmplId(); //"chatcmpl-8pMMaqXMK68B3nyDBrapTDrhkHBQK";
+    let body = response.body;
+    let id = generateChatcmplId();
+    
+    if (!response.ok) {
+      console.error("[ERROR] API请求失败:", response.status, response.statusText);
+      
+      if (req.stream) {
+        // 对于流请求，返回一个错误流，但保持SSE连接格式
+        const errorStream = new ReadableStream({
+          start(controller) {
+            // 发送错误开始
+            controller.enqueue(`data: ${JSON.stringify({
+              id,
+              choices: [{
+                index: 0,
+                delta: {
+                  role: "assistant",
+                  content: ""
+                },
+                finish_reason: null
+              }],
+              created: Math.floor(Date.now()/1000),
+              model,
+              object: "chat.completion.chunk"
+            })}\n\n`);
+            
+            // 结束流
+            controller.enqueue(`data: ${JSON.stringify({
+              id,
+              choices: [{
+                index: 0,
+                delta: {},
+                finish_reason: "error"
+              }],
+              created: Math.floor(Date.now()/1000),
+              model,
+              object: "chat.completion.chunk"
+            })}\n\n`);
+            
+            controller.enqueue("data: [DONE]\n\n");
+            controller.close();
+          }
+        });
+        
+        return new Response(errorStream, fixCors({
+          status: 200, // 返回200以保持流连接
+          headers: {
+            "Content-Type": "text/event-stream",
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive"
+          }
+        }));
+      } else {
+        // 对于非流请求，返回标准错误响应
+        return new Response(JSON.stringify({
+          error: {
+            message: `API请求失败: ${response.status} ${response.statusText}`,
+            type: "api_error",
+            code: response.status
+          }
+        }), fixCors({ status: 200 })); // 使用200而不是错误状态码
+      }
+    }
+
     if (req.stream) {
       body = response.body
         .pipeThrough(new TextDecoderStream())
@@ -178,12 +241,138 @@ async function handleCompletions (req, apiKey) {
           model, id, last: [],
         }))
         .pipeThrough(new TextEncoderStream());
+        
+      return new Response(body, fixCors({
+        status: 200,
+        headers: {
+          "Content-Type": "text/event-stream",
+          "Cache-Control": "no-cache",
+          "Connection": "keep-alive"
+        }
+      }));
     } else {
-      body = await response.text();
-      body = processCompletionsResponse(JSON.parse(body), model, id);
+      try {
+        const text = await response.text();
+        let jsonData;
+        
+        try {
+          jsonData = JSON.parse(text);
+        } catch (jsonErr) {
+          console.error("[ERROR] 无法解析API响应JSON:", jsonErr);
+          console.error("[DEBUG] 原始响应:", text);
+          
+          return new Response(JSON.stringify({
+            id,
+            choices: [{
+              index: 0,
+              message: {
+                role: "assistant",
+                content: "服务返回了无效的JSON格式"
+              },
+              logprobs: null,
+              finish_reason: "error"
+            }],
+            created: Math.floor(Date.now()/1000),
+            model,
+            object: "chat.completion",
+            usage: { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 }
+          }), fixCors({ status: 200 }));
+        }
+        
+        body = processCompletionsResponse(jsonData, model, id);
+        return new Response(body, fixCors({ status: 200 }));
+      } catch (err) {
+        console.error("[ERROR] 处理响应文本时出错:", err);
+        
+        return new Response(JSON.stringify({
+          id,
+          choices: [{
+            index: 0,
+            message: {
+              role: "assistant",
+              content: "处理响应时出错"
+            },
+            logprobs: null,
+            finish_reason: "error"
+          }],
+          created: Math.floor(Date.now()/1000),
+          model,
+          object: "chat.completion",
+          usage: { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 }
+        }), fixCors({ status: 200 }));
+      }
+    }
+  } catch (err) {
+    console.error("[ERROR] 处理请求时发生异常:", err);
+    
+    // 即使发生异常，也确保返回有效响应
+    const id = generateChatcmplId();
+    
+    if (req.stream) {
+      // 对于流请求，返回一个错误流，但保持SSE连接格式
+      const errorStream = new ReadableStream({
+        start(controller) {
+          // 发送错误开始
+          controller.enqueue(`data: ${JSON.stringify({
+            id,
+            choices: [{
+              index: 0,
+              delta: {
+                role: "assistant",
+                content: ""
+              },
+              finish_reason: null
+            }],
+            created: Math.floor(Date.now()/1000),
+            model,
+            object: "chat.completion.chunk"
+          })}\n\n`);
+          
+          // 结束流
+          controller.enqueue(`data: ${JSON.stringify({
+            id,
+            choices: [{
+              index: 0,
+              delta: {},
+              finish_reason: "error"
+            }],
+            created: Math.floor(Date.now()/1000),
+            model,
+            object: "chat.completion.chunk"
+          })}\n\n`);
+          
+          controller.enqueue("data: [DONE]\n\n");
+          controller.close();
+        }
+      });
+      
+      return new Response(errorStream, fixCors({
+        status: 200,
+        headers: {
+          "Content-Type": "text/event-stream",
+          "Cache-Control": "no-cache",
+          "Connection": "keep-alive"
+        }
+      }));
+    } else {
+      return new Response(JSON.stringify({
+        id,
+        choices: [{
+          index: 0,
+          message: {
+            role: "assistant",
+            content: "处理请求时发生错误"
+          },
+          logprobs: null,
+          finish_reason: "error"
+        }],
+        created: Math.floor(Date.now()/1000),
+        model,
+        object: "chat.completion",
+        usage: { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 }
+      }), fixCors({ status: 200 }));
     }
   }
-  return new Response(body, fixCors(response));
 }
 
 const harmCategory = [
@@ -678,6 +867,9 @@ async function toOpenAiStream (chunk, controller) {
   if (!line) { return; }
   
   let data;
+  let shouldProcess = true; // 标记是否处理当前数据
+  let isError = false;      // 标记当前数据是否为错误
+  
   try {
     data = JSON.parse(line);
   } catch (err) {
@@ -687,17 +879,23 @@ async function toOpenAiStream (chunk, controller) {
     // 判断当前是否已经有内容在输出
     if (this.last.length > 0) {
       // 如果已经有内容在输出，则不插入错误消息，避免破坏内容
-      console.error("[WARN] 已有内容输出，跳过错误消息插入");
-      return;
+      console.error("[WARN] 已有内容输出，跳过错误消息但保持连接");
+      shouldProcess = false; // 不处理这个错误数据，但不中断连接
+    } else {
+      // 创建一个表示错误的候选项，但使用空内容避免污染输出
+      const candidates = [{
+        finishReason: "error",
+        content: { parts: [{ text: "" }] },
+        index: 0,
+      }];
+      data = { candidates };
+      isError = true;
     }
-    
-    // 创建一个表示错误的候选项，但使用空内容避免污染输出
-    const candidates = [{
-      finishReason: "error",
-      content: { parts: [{ text: "" }] },
-      index: 0,
-    }];
-    data = { candidates };
+  }
+  
+  // 如果不应处理，直接返回但不中断连接
+  if (!shouldProcess) {
+    return;
   }
   
   // 检查是否为ping消息
@@ -721,16 +919,22 @@ async function toOpenAiStream (chunk, controller) {
     // 判断当前是否已经有内容在输出
     if (this.last.length > 0) {
       // 如果已经有内容在输出，则不插入错误消息，避免破坏内容
-      console.error("[WARN] 已有内容输出，跳过错误消息插入");
-      return;
+      console.error("[WARN] 已有内容输出，跳过错误消息但保持连接");
+      shouldProcess = false; // 不处理这个错误数据，但不中断连接
+    } else {
+      // 创建一个有效的candidates数组，但使用空内容避免污染输出
+      data.candidates = [{
+        finishReason: "error",
+        content: { parts: [{ text: "" }] },
+        index: 0,
+      }];
+      isError = true;
     }
-    
-    // 创建一个有效的candidates数组，但使用空内容避免污染输出
-    data.candidates = [{
-      finishReason: "error",
-      content: { parts: [{ text: "" }] },
-      index: 0,
-    }];
+  }
+  
+  // 如果不应处理，直接返回但不中断连接
+  if (!shouldProcess) {
+    return;
   }
   
   // 检查candidates是否为空数组
@@ -741,16 +945,22 @@ async function toOpenAiStream (chunk, controller) {
     // 判断当前是否已经有内容在输出
     if (this.last.length > 0) {
       // 如果已经有内容在输出，则不插入错误消息，避免破坏内容
-      console.error("[WARN] 已有内容输出，跳过错误消息插入");
-      return;
+      console.error("[WARN] 已有内容输出，跳过错误消息但保持连接");
+      shouldProcess = false; // 不处理这个错误数据，但不中断连接
+    } else {
+      // 添加一个默认候选项，但使用空内容避免污染输出
+      data.candidates = [{
+        finishReason: "error",
+        content: { parts: [{ text: "" }] },
+        index: 0,
+      }];
+      isError = true;
     }
-    
-    // 添加一个默认候选项，但使用空内容避免污染输出
-    data.candidates = [{
-      finishReason: "error",
-      content: { parts: [{ text: "" }] },
-      index: 0,
-    }];
+  }
+  
+  // 如果不应处理，直接返回但不中断连接
+  if (!shouldProcess) {
+    return;
   }
   
   try {
@@ -758,6 +968,12 @@ async function toOpenAiStream (chunk, controller) {
     
     // 确保index存在
     cand.index = cand.index || 0; // absent in new -002 models response
+    
+    // 如果是错误且已经有输出，跳过处理
+    if (isError && this.last.length > 0) {
+      console.error("[WARN] 跳过错误处理以避免中断已有输出");
+      return;
+    }
     
     if (!this.last[cand.index]) {
       const result = transform(data, false, "first");
@@ -774,7 +990,7 @@ async function toOpenAiStream (chunk, controller) {
       if (result) { // 只有在transform返回有效内容时才发送
         controller.enqueue(result);
       }
-    } else {
+    } else if (!isError) { // 只有在非错误情况下才记录
       console.error("[ERROR] 候选项缺少content字段");
       console.error("[DEBUG] 候选项内容:", JSON.stringify(cand));
       // 不发送空内容，但保留在last中以便在flush时正确处理
@@ -786,7 +1002,8 @@ async function toOpenAiStream (chunk, controller) {
     // 判断当前是否已经有内容在输出
     if (this.last.length > 0) {
       // 如果已经有内容在输出，则不插入错误消息，避免破坏内容
-      console.error("[WARN] 已有内容输出，跳过错误消息插入");
+      console.error("[WARN] 已有内容输出，跳过错误消息但保持连接");
+      // 不处理此错误，但不中断连接
       return;
     }
     
