@@ -71,6 +71,8 @@ const API_VERSION = "v1beta";
 const API_CLIENT = "genai-js/0.21.0"; // npm view @google/generative-ai version
 const makeHeaders = (apiKey, more) => ({
   "x-goog-api-client": API_CLIENT,
+  "Accept-Encoding": "gzip, deflate",
+  "Accept": "*/*",
   ...(apiKey && { "x-goog-api-key": apiKey }),
   ...more
 });
@@ -152,15 +154,12 @@ async function handleCompletions (req, apiKey) {
       model = req.model;
   }
   const TASK = req.stream ? "streamGenerateContent" : "generateContent";
-  
-  // 使用URL查询参数传递API key
-  let url = `${BASE_URL}/${API_VERSION}/models/${model}:${TASK}?key=${apiKey}`;
-  if (req.stream) { url += "&alt=sse"; }
-  
+  let url = `${BASE_URL}/${API_VERSION}/models/${model}:${TASK}`;
+  if (req.stream) { url += "?alt=sse"; }
   const response = await fetch(url, {
     method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(await transformRequest(req)),
+    headers: makeHeaders(apiKey, { "Content-Type": "application/json" }),
+    body: JSON.stringify(await transformRequest(req)), // try
   });
 
   let body = response.body;
@@ -246,7 +245,12 @@ const parseImg = async (url) => {
   let mimeType, data;
   if (url.startsWith("http://") || url.startsWith("https://")) {
     try {
-      const response = await fetch(url);
+      const response = await fetch(url, {
+        headers: {
+          "Accept-Encoding": "gzip, deflate",
+          "Accept": "*/*"
+        }
+      });
       if (!response.ok) {
         throw new Error(`${response.status} ${response.statusText} (${url})`);
       }
