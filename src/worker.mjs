@@ -152,12 +152,15 @@ async function handleCompletions (req, apiKey) {
       model = req.model;
   }
   const TASK = req.stream ? "streamGenerateContent" : "generateContent";
-  let url = `${BASE_URL}/${API_VERSION}/models/${model}:${TASK}`;
-  if (req.stream) { url += "?alt=sse"; }
+  
+  // 使用URL查询参数传递API key
+  let url = `${BASE_URL}/${API_VERSION}/models/${model}:${TASK}?key=${apiKey}`;
+  if (req.stream) { url += "&alt=sse"; }
+  
   const response = await fetch(url, {
     method: "POST",
-    headers: makeHeaders(apiKey, { "Content-Type": "application/json" }),
-    body: JSON.stringify(await transformRequest(req)), // try
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(await transformRequest(req)),
   });
 
   let body = response.body;
