@@ -154,78 +154,15 @@ async function handleCompletions (req, apiKey) {
   const TASK = req.stream ? "streamGenerateContent" : "generateContent";
   let url = `${BASE_URL}/${API_VERSION}/models/${model}:${TASK}`;
   if (req.stream) { url += "?alt=sse"; }
-  
-  try {
-    const response = await fetch(url, {
-      method: "POST",
-      headers: makeHeaders(apiKey, { "Content-Type": "application/json" }),
-      body: JSON.stringify(await transformRequest(req)),
-    });
+  const response = await fetch(url, {
+    method: "POST",
+    headers: makeHeaders(apiKey, { "Content-Type": "application/json" }),
+    body: JSON.stringify(await transformRequest(req)), // try
+  });
 
-    let body = response.body;
-    let id = generateChatcmplId();
-    
-    if (!response.ok) {
-      console.error("[ERROR] API请求失败:", response.status, response.statusText);
-      
-      if (req.stream) {
-        // 对于流请求，返回一个错误流，但保持SSE连接格式
-        const errorStream = new ReadableStream({
-          start(controller) {
-            // 发送错误开始
-            controller.enqueue(`data: ${JSON.stringify({
-              id,
-              choices: [{
-                index: 0,
-                delta: {
-                  role: "assistant",
-                  content: ""
-                },
-                finish_reason: null
-              }],
-              created: Math.floor(Date.now()/1000),
-              model,
-              object: "chat.completion.chunk"
-            })}\n\n`);
-            
-            // 结束流
-            controller.enqueue(`data: ${JSON.stringify({
-              id,
-              choices: [{
-                index: 0,
-                delta: {},
-                finish_reason: "error"
-              }],
-              created: Math.floor(Date.now()/1000),
-              model,
-              object: "chat.completion.chunk"
-            })}\n\n`);
-            
-            controller.enqueue("data: [DONE]\n\n");
-            controller.close();
-          }
-        });
-        
-        return new Response(errorStream, fixCors({
-          status: 200, // 返回200以保持流连接
-          headers: {
-            "Content-Type": "text/event-stream",
-            "Cache-Control": "no-cache",
-            "Connection": "keep-alive"
-          }
-        }));
-      } else {
-        // 对于非流请求，返回标准错误响应
-        return new Response(JSON.stringify({
-          error: {
-            message: `API请求失败: ${response.status} ${response.statusText}`,
-            type: "api_error",
-            code: response.status
-          }
-        }), fixCors({ status: 200 })); // 使用200而不是错误状态码
-      }
-    }
-
+  let body = response.body;
+  if (response.ok) {
+    let id = generateChatcmplId(); //"chatcmpl-8pMMaqXMK68B3nyDBrapTDrhkHBQK";
     if (req.stream) {
       body = response.body
         .pipeThrough(new TextDecoderStream())
@@ -238,141 +175,17 @@ async function handleCompletions (req, apiKey) {
           transform: toOpenAiStream,
           flush: toOpenAiStreamFlush,
           streamIncludeUsage: req.stream_options?.include_usage,
-          model, id, last: [],
+          model, id,
+          last: [],
+          lastReceivedData: null
         }))
         .pipeThrough(new TextEncoderStream());
-        
-      return new Response(body, fixCors({
-        status: 200,
-        headers: {
-          "Content-Type": "text/event-stream",
-          "Cache-Control": "no-cache",
-          "Connection": "keep-alive"
-        }
-      }));
     } else {
-      try {
-        const text = await response.text();
-        let jsonData;
-        
-        try {
-          jsonData = JSON.parse(text);
-        } catch (jsonErr) {
-          console.error("[ERROR] 无法解析API响应JSON:", jsonErr);
-          console.error("[DEBUG] 原始响应:", text);
-          
-          return new Response(JSON.stringify({
-            id,
-            choices: [{
-              index: 0,
-              message: {
-                role: "assistant",
-                content: "服务返回了无效的JSON格式"
-              },
-              logprobs: null,
-              finish_reason: "error"
-            }],
-            created: Math.floor(Date.now()/1000),
-            model,
-            object: "chat.completion",
-            usage: { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 }
-          }), fixCors({ status: 200 }));
-        }
-        
-        body = processCompletionsResponse(jsonData, model, id);
-        return new Response(body, fixCors({ status: 200 }));
-      } catch (err) {
-        console.error("[ERROR] 处理响应文本时出错:", err);
-        
-        return new Response(JSON.stringify({
-          id,
-          choices: [{
-            index: 0,
-            message: {
-              role: "assistant",
-              content: "处理响应时出错"
-            },
-            logprobs: null,
-            finish_reason: "error"
-          }],
-          created: Math.floor(Date.now()/1000),
-          model,
-          object: "chat.completion",
-          usage: { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 }
-        }), fixCors({ status: 200 }));
-      }
-    }
-  } catch (err) {
-    console.error("[ERROR] 处理请求时发生异常:", err);
-    
-    // 即使发生异常，也确保返回有效响应
-    const id = generateChatcmplId();
-    
-    if (req.stream) {
-      // 对于流请求，返回一个错误流，但保持SSE连接格式
-      const errorStream = new ReadableStream({
-        start(controller) {
-          // 发送错误开始
-          controller.enqueue(`data: ${JSON.stringify({
-            id,
-            choices: [{
-              index: 0,
-              delta: {
-                role: "assistant",
-                content: ""
-              },
-              finish_reason: null
-            }],
-            created: Math.floor(Date.now()/1000),
-            model,
-            object: "chat.completion.chunk"
-          })}\n\n`);
-          
-          // 结束流
-          controller.enqueue(`data: ${JSON.stringify({
-            id,
-            choices: [{
-              index: 0,
-              delta: {},
-              finish_reason: "error"
-            }],
-            created: Math.floor(Date.now()/1000),
-            model,
-            object: "chat.completion.chunk"
-          })}\n\n`);
-          
-          controller.enqueue("data: [DONE]\n\n");
-          controller.close();
-        }
-      });
-      
-      return new Response(errorStream, fixCors({
-        status: 200,
-        headers: {
-          "Content-Type": "text/event-stream",
-          "Cache-Control": "no-cache",
-          "Connection": "keep-alive"
-        }
-      }));
-    } else {
-      return new Response(JSON.stringify({
-        id,
-        choices: [{
-          index: 0,
-          message: {
-            role: "assistant",
-            content: "处理请求时发生错误"
-          },
-          logprobs: null,
-          finish_reason: "error"
-        }],
-        created: Math.floor(Date.now()/1000),
-        model,
-        object: "chat.completion",
-        usage: { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 }
-      }), fixCors({ status: 200 }));
+      body = await response.text();
+      body = processCompletionsResponse(JSON.parse(body), model, id);
     }
   }
+  return new Response(body, fixCors(response));
 }
 
 const harmCategory = [
@@ -536,275 +349,58 @@ const reasonsMap = { //https://ai.google.dev/api/rest/v1/GenerateContentResponse
   // :"function_call",
 };
 const SEP = "\n\n|>";
-const transformCandidates = (key, cand) => {
-  try {
-    // 安全检查
-    if (!cand) {
-      console.error("[ERROR] 候选项为空");
-      return {
-        index: 0,
-        [key]: {
-          role: "assistant",
-          content: "处理候选项时出错"
-        },
-        logprobs: null,
-        finish_reason: "error"
-      };
-    }
-
-    // 检查content和parts是否存在
-    let contentText = "";
-    if (cand.content && Array.isArray(cand.content.parts)) {
-      try {
-        contentText = cand.content.parts.map(p => p?.text || "").join(SEP);
-      } catch (err) {
-        console.error("[ERROR] 处理content.parts时出错:", err);
-        console.error("[DEBUG] content.parts内容:", JSON.stringify(cand.content.parts));
-        contentText = "内容处理出错";
-      }
-    } else if (cand.content) {
-      // content存在但parts不是数组
-      console.error("[ERROR] content.parts不是数组或不存在");
-      console.error("[DEBUG] content内容:", JSON.stringify(cand.content));
-      contentText = "API返回了不完整的内容";
-    } else {
-      // content不存在
-      console.error("[ERROR] 候选项缺少content字段");
-      console.error("[DEBUG] 候选项内容:", JSON.stringify(cand));
-      contentText = "无法获取内容";
-    }
-
-    return {
-      index: cand.index || 0, // 0-index is absent in new -002 models response
-      [key]: {
-        role: "assistant",
-        content: contentText
-      },
-      logprobs: null,
-      finish_reason: reasonsMap[cand.finishReason] || cand.finishReason || "error",
-    };
-  } catch (err) {
-    console.error("[ERROR] 转换候选项时发生错误:", err);
-    console.error("[DEBUG] 候选项内容:", JSON.stringify(cand));
-    return {
-      index: 0,
-      [key]: {
-        role: "assistant",
-        content: "转换候选项时出错"
-      },
-      logprobs: null,
-      finish_reason: "error"
-    };
-  }
-};
+const transformCandidates = (key, cand) => ({
+  index: cand.index || 0, // 0-index is absent in new -002 models response
+  [key]: {
+    role: "assistant",
+    content: cand.content?.parts.map(p => p.text).join(SEP) },
+  logprobs: null,
+  finish_reason: reasonsMap[cand.finishReason] || cand.finishReason,
+});
 const transformCandidatesMessage = transformCandidates.bind(null, "message");
 const transformCandidatesDelta = transformCandidates.bind(null, "delta");
 
-const transformUsage = (data) => {
-  try {
-    if (!data) {
-      console.error("[ERROR] usageMetadata为空");
-      return {
-        completion_tokens: 0,
-        prompt_tokens: 0,
-        total_tokens: 0
-      };
-    }
-    
-    return {
-      completion_tokens: data.candidatesTokenCount || 0,
-      prompt_tokens: data.promptTokenCount || 0,
-      total_tokens: data.totalTokenCount || 0
-    };
-  } catch (err) {
-    console.error("[ERROR] 处理usageMetadata时出错:", err);
-    console.error("[DEBUG] usageMetadata内容:", JSON.stringify(data));
-    return {
-      completion_tokens: 0,
-      prompt_tokens: 0,
-      total_tokens: 0
-    };
-  }
-};
+const transformUsage = (data) => ({
+  completion_tokens: data.candidatesTokenCount,
+  prompt_tokens: data.promptTokenCount,
+  total_tokens: data.totalTokenCount
+});
 
 const processCompletionsResponse = (data, model, id) => {
-  try {
-    // 对数据完整性进行详细检查
-    if (!data) {
-      console.error("[ERROR] Gemini API返回空数据");
-      console.error("[DEBUG] 完整响应:", JSON.stringify(data));
-      // 返回一个合理的空响应
-      return JSON.stringify({
-        id,
-        choices: [{
-          index: 0,
-          message: {
-            role: "assistant",
-            content: "抱歉，服务暂时无法提供回答。"
-          },
-          logprobs: null,
-          finish_reason: "error"
-        }],
-        created: Math.floor(Date.now()/1000),
-        model,
-        object: "chat.completion",
-        usage: { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 }
-      });
-    }
-    
-    // 检查是否为ping消息
-    // ping消息通常只有usageMetadata和modelVersion，没有candidates，且promptTokenCount很低
-    if (!data.candidates && data.usageMetadata && 
-        data.modelVersion && 
-        data.usageMetadata.promptTokenCount <= 5) {
-      console.log("[INFO] 检测到ping消息");
-      console.log("[DEBUG] Ping消息内容:", JSON.stringify(data));
-      
-      // 为ping消息创建一个特殊响应
-      return JSON.stringify({
-        id,
-        choices: [{
-          index: 0,
-          message: {
-            role: "assistant",
-            content: "pong"
-          },
-          logprobs: null,
-          finish_reason: "stop"
-        }],
-        created: Math.floor(Date.now()/1000),
-        model,
-        object: "chat.completion",
-        usage: transformUsage(data.usageMetadata)
-      });
-    }
-    
-    // 检查candidates是否存在
-    if (!data.candidates) {
-      console.error("[ERROR] Gemini API返回的数据中缺少candidates字段");
-      console.error("[DEBUG] 完整响应:", JSON.stringify(data));
-      // 返回包含错误信息的响应
-      return JSON.stringify({
-        id,
-        choices: [{
-          index: 0,
-          message: {
-            role: "assistant",
-            content: "API服务返回了异常数据结构。"
-          },
-          logprobs: null,
-          finish_reason: "error"
-        }],
-        created: Math.floor(Date.now()/1000),
-        model,
-        object: "chat.completion",
-        usage: data.usageMetadata ? transformUsage(data.usageMetadata) : { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 }
-      });
-    }
-    
-    // 检查candidates是否为数组
-    if (!Array.isArray(data.candidates)) {
-      console.error("[ERROR] Gemini API返回的candidates不是数组");
-      console.error("[DEBUG] candidates类型:", typeof data.candidates);
-      console.error("[DEBUG] 完整响应:", JSON.stringify(data));
-      
-      // 尝试转换非数组的candidates为数组
-      const candidatesArray = [].concat(data.candidates).filter(Boolean);
-      
-      if (candidatesArray.length > 0) {
-        // 如果成功转换，继续使用转换后的数组
-        data.candidates = candidatesArray;
-      } else {
-        // 返回一个包含错误信息的响应
-        return JSON.stringify({
-          id,
-          choices: [{
-            index: 0,
-            message: {
-              role: "assistant",
-              content: "API服务返回了意外的数据格式。"
-            },
-            logprobs: null,
-            finish_reason: "error"
-          }],
-          created: Math.floor(Date.now()/1000),
-          model,
-          object: "chat.completion",
-          usage: data.usageMetadata ? transformUsage(data.usageMetadata) : { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 }
-        });
-      }
-    }
-    
-    // 检查candidates是否为空数组
-    if (data.candidates.length === 0) {
-      console.error("[ERROR] Gemini API返回的candidates是空数组");
-      console.error("[DEBUG] 完整响应:", JSON.stringify(data));
-      // 返回一个空的但有效的响应
-      return JSON.stringify({
-        id,
-        choices: [{
-          index: 0,
-          message: {
-            role: "assistant",
-            content: "API服务无法生成回答。"
-          },
-          logprobs: null,
-          finish_reason: "error"
-        }],
-        created: Math.floor(Date.now()/1000),
-        model,
-        object: "chat.completion",
-        usage: data.usageMetadata ? transformUsage(data.usageMetadata) : { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 }
-      });
-    }
-    
-    // 正常处理有效响应
-    return JSON.stringify({
-      id,
-      choices: data.candidates.map((cand, index) => {
-        try {
-          return transformCandidatesMessage(cand);
-        } catch (err) {
-          console.error(`[ERROR] 转换候选项 #${index} 时出错:`, err.message);
-          console.error("[DEBUG] 候选项内容:", JSON.stringify(cand));
-          // 返回一个安全的替代项
-          return {
-            index,
-            message: {
-              role: "assistant",
-              content: "内容处理出错，无法显示完整回答。"
-            },
-            logprobs: null,
-            finish_reason: "error"
-          };
-        }
-      }),
-      created: Math.floor(Date.now()/1000),
-      model,
-      object: "chat.completion",
-      usage: data.usageMetadata ? transformUsage(data.usageMetadata) : { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 }
-    });
-  } catch (error) {
-    console.error("[ERROR] 处理完成响应时发生错误:", error);
-    console.error("[DEBUG] 尝试处理的数据:", JSON.stringify(data));
-    // 即使在处理函数发生错误时也能返回有效响应
-    return JSON.stringify({
-      id,
-      choices: [{
-        index: 0,
-        message: {
-          role: "assistant",
-          content: "处理响应时发生内部错误。"
-        },
-        logprobs: null,
-        finish_reason: "error"
-      }],
-      created: Math.floor(Date.now()/1000),
-      model,
-      object: "chat.completion",
-      usage: { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 }
-    });
+  // Default empty choices and null usage
+  let choices = [];
+  let usage = null;
+
+  // Safely process candidates if the array exists
+  if (data && Array.isArray(data.candidates)) {
+    choices = data.candidates.map(transformCandidatesMessage);
+  } else {
+    console.warn("processCompletionsResponse: Received non-streaming response without a valid 'candidates' array.", data);
+    // Decide how to represent this: maybe an empty choices array is sufficient,
+    // or perhaps add an error object to the response if appropriate.
+    // For a "ping" that might just return feedback, empty choices is likely okay.
   }
+
+  // Safely process usageMetadata if it exists
+  if (data && data.usageMetadata) {
+    try {
+        usage = transformUsage(data.usageMetadata);
+    } catch (usageError) {
+        console.error("Error transforming usage metadata:", usageError, data.usageMetadata);
+        // Keep usage as null if transformation fails
+    }
+  } else {
+      console.warn("processCompletionsResponse: Received non-streaming response without 'usageMetadata'.", data);
+  }
+
+  return JSON.stringify({
+    id,
+    choices, // Use the safely processed choices
+    created: Math.floor(Date.now()/1000),
+    model,
+    object: "chat.completion",
+    usage, // Use the safely processed usage
+  });
 };
 
 const responseLineRE = /^data: (.*)(?:\n\n|\r\r|\r\n\r\n)/;
@@ -827,210 +423,182 @@ async function parseStreamFlush (controller) {
 }
 
 function transformResponseStream (data, stop, first) {
-  try {
-    const item = transformCandidatesDelta(data.candidates[0]);
-    
-    // 检查是否为错误消息，且是否应该忽略
-    if (item.finish_reason === "error" && !stop && !first) {
-      // 对于中间出现的错误，不将其添加到流中
-      console.error("[WARN] 忽略流中间出现的错误消息，避免污染内容");
-      return null; // 返回null表示不输出这个消息
-    }
-    
-    if (stop) { item.delta = {}; } else { item.finish_reason = null; }
-    if (first) { item.delta.content = ""; } else { delete item.delta.role; }
-    
-    const output = {
-      id: this.id,
-      choices: [item],
-      created: Math.floor(Date.now()/1000),
-      model: this.model,
-      //system_fingerprint: "fp_69829325d0",
-      object: "chat.completion.chunk",
-    };
-    
-    if (data.usageMetadata && this.streamIncludeUsage) {
-      output.usage = stop ? transformUsage(data.usageMetadata) : null;
-    }
-    
-    return "data: " + JSON.stringify(output) + delimiter;
-  } catch (err) {
-    console.error("[ERROR] 转换流响应时出错:", err);
-    // 对于转换错误，返回null而不是错误消息，避免污染内容
-    return null;
+  if (!data || !data.candidates || !Array.isArray(data.candidates) || data.candidates.length === 0) {
+      console.error("transformResponseStream called with invalid data:", data);
+      return null;
   }
+
+  const cand = data.candidates[0];
+  const item = transformCandidatesDelta(cand);
+
+  if (stop) {
+      item.delta = {};
+      item.finish_reason = reasonsMap[cand.finishReason] || cand.finishReason || "stop";
+  } else {
+      item.finish_reason = null;
+  }
+
+  if (first) {
+      item.delta = item.delta || {};
+      item.delta.role = "assistant";
+      item.delta.content = "";
+  } else {
+      if (item.delta) {
+          delete item.delta.role;
+      }
+  }
+
+  const choiceItem = {
+      index: item.index || 0,
+      delta: item.delta || {},
+      logprobs: item.logprobs,
+      finish_reason: item.finish_reason,
+  };
+
+  const output = {
+    id: this.id,
+    choices: [choiceItem],
+    created: Math.floor(Date.now()/1000),
+    model: this.model,
+    object: "chat.completion.chunk",
+  };
+
+  return "data: " + JSON.stringify(output) + delimiter;
 }
 const delimiter = "\n\n";
 async function toOpenAiStream (chunk, controller) {
   const transform = transformResponseStream.bind(this);
   const line = await chunk;
   if (!line) { return; }
-  
   let data;
-  let shouldProcess = true; // 标记是否处理当前数据
-  let isError = false;      // 标记当前数据是否为错误
-  
   try {
     data = JSON.parse(line);
+    this.lastReceivedData = data;
   } catch (err) {
-    console.error("[ERROR] 解析流数据行失败:", err);
-    console.error("[DEBUG] 原始行数据:", line);
-    
-    // 判断当前是否已经有内容在输出
-    if (this.last.length > 0) {
-      // 如果已经有内容在输出，则不插入错误消息，避免破坏内容
-      console.error("[WARN] 已有内容输出，跳过错误消息但保持连接");
-      shouldProcess = false; // 不处理这个错误数据，但不中断连接
-    } else {
-      // 创建一个表示错误的候选项，但使用空内容避免污染输出
-      const candidates = [{
-        finishReason: "error",
-        content: { parts: [{ text: "" }] },
+    console.error("Error parsing SSE line:", line, err);
+    const errorOutput = {
+      id: this.id,
+      choices: [{
         index: 0,
-      }];
-      data = { candidates };
-      isError = true;
-    }
-  }
-  
-  // 如果不应处理，直接返回但不中断连接
-  if (!shouldProcess) {
-    return;
-  }
-  
-  // 检查是否为ping消息
-  if (!data.candidates && data.usageMetadata && 
-      data.modelVersion && 
-      data.usageMetadata.promptTokenCount <= 5) {
-    console.log("[INFO] 检测到流式ping消息");
-    
-    // 为ping消息创建一个特殊候选项
-    data.candidates = [{
-      finishReason: "stop",
-      content: { parts: [{ text: "pong" }] },
-      index: 0,
-    }];
-  }
-  // 检查candidates是否存在且为数组
-  else if (!data.candidates || !Array.isArray(data.candidates)) {
-    console.error("[ERROR] 流响应中缺少candidates数组或格式不正确");
-    console.error("[DEBUG] 响应数据:", JSON.stringify(data));
-    
-    // 判断当前是否已经有内容在输出
-    if (this.last.length > 0) {
-      // 如果已经有内容在输出，则不插入错误消息，避免破坏内容
-      console.error("[WARN] 已有内容输出，跳过错误消息但保持连接");
-      shouldProcess = false; // 不处理这个错误数据，但不中断连接
-    } else {
-      // 创建一个有效的candidates数组，但使用空内容避免污染输出
-      data.candidates = [{
-        finishReason: "error",
-        content: { parts: [{ text: "" }] },
-        index: 0,
-      }];
-      isError = true;
-    }
-  }
-  
-  // 如果不应处理，直接返回但不中断连接
-  if (!shouldProcess) {
-    return;
-  }
-  
-  // 检查candidates是否为空数组
-  if (data.candidates.length === 0) {
-    console.error("[ERROR] 流响应中candidates是空数组");
-    console.error("[DEBUG] 响应数据:", JSON.stringify(data));
-    
-    // 判断当前是否已经有内容在输出
-    if (this.last.length > 0) {
-      // 如果已经有内容在输出，则不插入错误消息，避免破坏内容
-      console.error("[WARN] 已有内容输出，跳过错误消息但保持连接");
-      shouldProcess = false; // 不处理这个错误数据，但不中断连接
-    } else {
-      // 添加一个默认候选项，但使用空内容避免污染输出
-      data.candidates = [{
-        finishReason: "error",
-        content: { parts: [{ text: "" }] },
-        index: 0,
-      }];
-      isError = true;
-    }
-  }
-  
-  // 如果不应处理，直接返回但不中断连接
-  if (!shouldProcess) {
-    return;
-  }
-  
-  try {
-    const cand = data.candidates[0];
-    
-    // 确保index存在
-    cand.index = cand.index || 0; // absent in new -002 models response
-    
-    // 如果是错误且已经有输出，跳过处理
-    if (isError && this.last.length > 0) {
-      console.error("[WARN] 跳过错误处理以避免中断已有输出");
-      return;
-    }
-    
-    if (!this.last[cand.index]) {
-      const result = transform(data, false, "first");
-      if (result) { // 只有在transform返回有效内容时才发送
-        controller.enqueue(result);
-      }
-    }
-    
-    this.last[cand.index] = data;
-    
-    // 检查content是否存在
-    if (cand.content) {
-      const result = transform(data);
-      if (result) { // 只有在transform返回有效内容时才发送
-        controller.enqueue(result);
-      }
-    } else if (!isError) { // 只有在非错误情况下才记录
-      console.error("[ERROR] 候选项缺少content字段");
-      console.error("[DEBUG] 候选项内容:", JSON.stringify(cand));
-      // 不发送空内容，但保留在last中以便在flush时正确处理
-    }
-  } catch (err) {
-    console.error("[ERROR] 处理流数据时出错:", err);
-    console.error("[DEBUG] 尝试处理的数据:", JSON.stringify(data));
-    
-    // 判断当前是否已经有内容在输出
-    if (this.last.length > 0) {
-      // 如果已经有内容在输出，则不插入错误消息，避免破坏内容
-      console.error("[WARN] 已有内容输出，跳过错误消息但保持连接");
-      // 不处理此错误，但不中断连接
-      return;
-    }
-    
-    // 替换为错误候选项，但使用空内容避免污染输出
-    const errorData = {
-      candidates: [{
-        finishReason: "error",
-        content: { parts: [{ text: "" }] },
-        index: 0,
-      }]
+        delta: { role: "assistant", content: `
+
+[Error parsing stream data: ${err.message}]` },
+        logprobs: null,
+        finish_reason: "error"
+      }],
+      created: Math.floor(Date.now()/1000),
+      model: this.model,
+      object: "chat.completion.chunk",
     };
-    this.last = [errorData];
-    const result = transform(errorData, false, "first");
-    if (result) { // 只有在transform返回有效内容时才发送
-      controller.enqueue(result);
+    controller.enqueue("data: " + JSON.stringify(errorOutput) + delimiter);
+    return;
+  }
+
+  if (data.promptFeedback) {
+    console.warn("Received promptFeedback:", JSON.stringify(data.promptFeedback));
+  }
+
+  if (data.candidates && Array.isArray(data.candidates) && data.candidates.length > 0) {
+    const cand = data.candidates[0];
+    cand.index = cand.index || 0;
+
+    if (!this.last[cand.index]) {
+       const firstChunkStr = transform(data, false, "first");
+       if (firstChunkStr) controller.enqueue(firstChunkStr);
     }
+
+    this.last[cand.index] = data;
+
+    if (cand.content && cand.content.parts && cand.content.parts.length > 0) {
+        const textContent = cand.content.parts.map(p => p.text).filter(Boolean).join("");
+        if (textContent) {
+           const contentChunkStr = transform(data);
+           if (contentChunkStr) controller.enqueue(contentChunkStr);
+        } else {
+           console.log("Received chunk with empty content parts for index:", cand.index);
+        }
+    } else if (cand.finishReason) {
+        console.log("Received chunk with finishReason for index:", cand.index, cand.finishReason);
+    } else {
+        console.log("Received chunk with candidate but no content/finishReason for index:", cand.index);
+    }
+
+  } else {
+    console.log("Received SSE chunk with empty or missing candidates array:", line);
   }
 }
 async function toOpenAiStreamFlush (controller) {
   const transform = transformResponseStream.bind(this);
-  if (this.last.length > 0) {
-    for (const data of this.last) {
-      const result = transform(data, "stop");
-      if (result) { // 只有在transform返回有效内容时才发送
-        controller.enqueue(result);
-      }
-    }
-    controller.enqueue("data: [DONE]" + delimiter);
+  let finalUsage = null;
+  let sentFinalChunk = false;
+
+  if (this.lastReceivedData?.usageMetadata && this.streamIncludeUsage) {
+      finalUsage = transformUsage(this.lastReceivedData.usageMetadata);
+      console.log("Captured final usage metadata from the last received chunk:", JSON.stringify(finalUsage));
   }
+
+  if (this.last.length > 0) {
+    for (let i = 0; i < this.last.length; i++) {
+        const data = this.last[i];
+        if (data) {
+            const finalChunkStrBase = transform(data, "stop");
+
+            if (finalChunkStrBase) {
+                let finalChunkStrToEnqueue = finalChunkStrBase;
+                if (i === this.last.length - 1 && finalUsage) {
+                    try {
+                        const outputJson = JSON.parse(finalChunkStrBase.substring(6));
+                        outputJson.usage = finalUsage;
+                        finalChunkStrToEnqueue = "data: " + JSON.stringify(outputJson) + delimiter;
+                        console.log("Injected final usage into the last candidate's final chunk.");
+                    } catch (e) {
+                        console.error("Error injecting final usage into last chunk:", e);
+                    }
+                }
+                controller.enqueue(finalChunkStrToEnqueue);
+                sentFinalChunk = true;
+            } else {
+                 console.log(`Failed to transform final data for candidate index ${i}, skipping.`);
+            }
+        } else {
+          console.log(`No final data stored for candidate index ${i}, skipping.`);
+        }
+    }
+  }
+
+  if (!sentFinalChunk && this.lastReceivedData) {
+      console.warn("Stream ended, but no candidate data was ever processed. Constructing final chunk from last received data.");
+
+      let finishReason = "unknown";
+      let blockReasonDetails = null;
+
+      if (this.lastReceivedData.promptFeedback?.blockReason) {
+          finishReason = "content_filter";
+          blockReasonDetails = this.lastReceivedData.promptFeedback.blockReason;
+          console.warn("Detected blockReason in promptFeedback:", blockReasonDetails);
+      } else {
+          console.warn("Could not determine specific finish reason when no candidates were received.");
+          finishReason = "error";
+      }
+
+      const finalChoice = {
+          index: 0,
+          delta: {},
+          logprobs: null,
+          finish_reason: finishReason,
+      };
+
+      const finalOutput = {
+          id: this.id,
+          choices: [finalChoice],
+          created: Math.floor(Date.now()/1000),
+          model: this.model,
+          object: "chat.completion.chunk",
+          usage: finalUsage,
+      };
+      controller.enqueue("data: " + JSON.stringify(finalOutput) + delimiter);
+      sentFinalChunk = true;
+  }
+
+  controller.enqueue("data: [DONE]" + delimiter);
 }
