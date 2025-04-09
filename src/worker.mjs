@@ -70,14 +70,13 @@ const API_VERSION = "v1beta";
 // https://github.com/google-gemini/generative-ai-js/blob/cf223ff4a1ee5a2d944c53cddb8976136382bee6/src/requests/request.ts#L71
 const API_CLIENT = "genai-js/0.21.0"; // npm view @google/generative-ai version
 const makeHeaders = (apiKey, more) => ({
-  "x-goog-api-client": API_CLIENT,
-  ...(apiKey && { "x-goog-api-key": apiKey }),
+  "Content-Type": "application/json",
   ...more
 });
 
 async function handleModels (apiKey) {
-  const response = await fetch(`${BASE_URL}/${API_VERSION}/models`, {
-    headers: makeHeaders(apiKey),
+  const response = await fetch(`${BASE_URL}/${API_VERSION}/models?key=${apiKey}`, {
+    headers: makeHeaders(null),
   });
   let { body } = response;
   if (response.ok) {
@@ -110,9 +109,9 @@ async function handleEmbeddings (req, apiKey) {
     req.model = DEFAULT_EMBEDDINGS_MODEL;
     model = "models/" + req.model;
   }
-  const response = await fetch(`${BASE_URL}/${API_VERSION}/${model}:batchEmbedContents`, {
+  const response = await fetch(`${BASE_URL}/${API_VERSION}/${model}:batchEmbedContents?key=${apiKey}`, {
     method: "POST",
-    headers: makeHeaders(apiKey, { "Content-Type": "application/json" }),
+    headers: makeHeaders(null, { "Content-Type": "application/json" }),
     body: JSON.stringify({
       "requests": req.input.map(text => ({
         model,
@@ -152,12 +151,19 @@ async function handleCompletions (req, apiKey) {
       model = req.model;
   }
   const TASK = req.stream ? "streamGenerateContent" : "generateContent";
-  let url = `${BASE_URL}/${API_VERSION}/models/${model}:${TASK}`;
-  if (req.stream) { url += "?alt=sse"; }
+  
+  // 构建URL，将API密钥作为URL参数
+  let url = `${BASE_URL}/${API_VERSION}/models/${model}:${TASK}?key=${apiKey}`;
+  
+  // 如果是流式请求，添加alt=sse参数
+  if (req.stream) { 
+    url += "&alt=sse"; 
+  }
+  
   const response = await fetch(url, {
     method: "POST",
-    headers: makeHeaders(apiKey, { "Content-Type": "application/json" }),
-    body: JSON.stringify(await transformRequest(req)), // try
+    headers: makeHeaders(null, { "Content-Type": "application/json" }),
+    body: JSON.stringify(await transformRequest(req)),
   });
 
   let body = response.body;
