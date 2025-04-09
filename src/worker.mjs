@@ -391,6 +391,38 @@ const processCompletionsResponse = (data, model, id, isPingRequest, req) => {
       console.error("Ping request detected:", req.messages);
     } else {
       console.error("Empty candidates array in non-SSE response:", data);
+      
+      // 对于非ping请求的空candidates，返回错误信息
+      if (!isPingRequest) {
+        const errorInfo = {
+          error: {
+            message: "Empty candidates array in response",
+            type: "empty_candidates",
+            original_response: data
+          }
+        };
+        
+        return JSON.stringify({
+          id,
+          choices: [{
+            index: 0,
+            message: {
+              role: "assistant",
+              content: `[GEMINI_ERROR_INFO]${JSON.stringify(errorInfo)}[/GEMINI_ERROR_INFO]`
+            },
+            logprobs: null,
+            finish_reason: "error"
+          }],
+          created: Math.floor(Date.now()/1000),
+          model,
+          object: "chat.completion",
+          usage: data.usageMetadata ? transformUsage(data.usageMetadata) : {
+            completion_tokens: 0,
+            prompt_tokens: data.promptTokenCount || (req.messages?.length || 1),
+            total_tokens: data.promptTokenCount || (req.messages?.length || 1)
+          }
+        });
+      }
     }
     
     // 返回一个有效的响应而不是报错
@@ -412,6 +444,38 @@ const processCompletionsResponse = (data, model, id, isPingRequest, req) => {
         completion_tokens: isPingRequest ? 1 : 0,
         prompt_tokens: data.promptTokenCount || (req.messages?.length || 1),
         total_tokens: data.promptTokenCount ? (data.promptTokenCount + (isPingRequest ? 1 : 0)) : (req.messages?.length || 1) + (isPingRequest ? 1 : 0)
+      }
+    });
+  }
+  
+  // 检查是否有安全过滤
+  if (data.promptFeedback && data.promptFeedback.blockReason === "SAFETY") {
+    const safetyInfo = {
+      error: {
+        message: "Content blocked due to safety concerns",
+        type: "safety_filter",
+        details: data.promptFeedback
+      }
+    };
+    
+    return JSON.stringify({
+      id,
+      choices: [{
+        index: 0,
+        message: {
+          role: "assistant",
+          content: `[GEMINI_SAFETY_INFO]${JSON.stringify(safetyInfo)}[/GEMINI_SAFETY_INFO]`
+        },
+        logprobs: null,
+        finish_reason: "content_filter"
+      }],
+      created: Math.floor(Date.now()/1000),
+      model,
+      object: "chat.completion",
+      usage: data.usageMetadata ? transformUsage(data.usageMetadata) : {
+        completion_tokens: 0,
+        prompt_tokens: data.promptTokenCount || (req.messages?.length || 1),
+        total_tokens: data.promptTokenCount || (req.messages?.length || 1)
       }
     });
   }
@@ -491,34 +555,73 @@ async function toOpenAiStream (chunk, controller) {
   } catch (err) {
     console.error(line);
     console.error(err);
-    const length = this.last.length || 1; // at least 1 error msg
-    const candidates = Array.from({ length }, (_, index) => ({
+    
+    // 返回特殊错误文本包含原始内容
+    const errorInfo = {
+      error: {
+        message: `Error parsing JSON: ${err.message}`,
+        type: "json_parse_error",
+        original_content: line
+      }
+    };
+    
+    const errorMessage = `[GEMINI_ERROR_INFO]${JSON.stringify(errorInfo)}[/GEMINI_ERROR_INFO]`;
+    const candidates = [{
       finishReason: "error",
-      content: { parts: [{ text: err }] },
-      index,
-    }));
+      content: { parts: [{ text: errorMessage }] },
+      index: 0,
+    }];
     data = { candidates };
   }
   
   // 处理candidates为空的情况
   if (!data.candidates || data.candidates.length === 0) {
     console.error("Empty candidates array in SSE response:", data);
-    // 跳过这个空的数据块，但记录下可能存在的提示反馈或安全信息
+    
+    // 返回特殊错误文本包含原始内容
+    const errorInfo = {
+      error: {
+        message: "Empty candidates array in response",
+        type: "empty_candidates",
+        original_response: data
+      }
+    };
+    
+    const errorMessage = `[GEMINI_ERROR_INFO]${JSON.stringify(errorInfo)}[/GEMINI_ERROR_INFO]`;
+    
+    // 创建带错误信息的候选项
+    data.candidates = [{
+      finishReason: "error",
+      content: { parts: [{ text: errorMessage }] },
+      index: 0,
+    }];
+    
+    // 在控制台记录提示反馈
     if (data.promptFeedback) {
       console.error("Prompt feedback:", data.promptFeedback);
     }
-    return; // 跳过这个空的数据块
   }
   
   const cand = data.candidates[0];
-  console.assert(data.candidates.length === 1, "Unexpected candidates count: %d", data.candidates.length);
   cand.index = cand.index || 0; // absent in new -002 models response
   
   // 检查finishReason
   if (cand.finishReason === "SAFETY") {
     console.error("Content blocked due to safety concerns", data);
-    // 可选：发送一个特殊的消息告知用户内容被安全过滤
-    // 这里保留原有行为，处理安全过滤的内容
+    
+    // 添加安全过滤特殊标记
+    if (cand.content && cand.content.parts && cand.content.parts.length > 0) {
+      const safetyInfo = {
+        error: {
+          message: "Content blocked due to safety concerns",
+          type: "safety_filter",
+          details: data.promptFeedback || {}
+        }
+      };
+      
+      const safetyMessage = `[GEMINI_SAFETY_INFO]${JSON.stringify(safetyInfo)}[/GEMINI_SAFETY_INFO]`;
+      cand.content.parts[0].text = safetyMessage + (cand.content.parts[0].text || "");
+    }
   }
   
   if (!this.last[cand.index]) {
