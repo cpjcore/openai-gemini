@@ -463,6 +463,33 @@ const processCompletionsResponse = (data, model, id) => {
       });
     }
     
+    // 检查是否为ping消息
+    // ping消息通常只有usageMetadata和modelVersion，没有candidates，且promptTokenCount很低
+    if (!data.candidates && data.usageMetadata && 
+        data.modelVersion && 
+        data.usageMetadata.promptTokenCount <= 5) {
+      console.log("[INFO] 检测到ping消息");
+      console.log("[DEBUG] Ping消息内容:", JSON.stringify(data));
+      
+      // 为ping消息创建一个特殊响应
+      return JSON.stringify({
+        id,
+        choices: [{
+          index: 0,
+          message: {
+            role: "assistant",
+            content: "pong"
+          },
+          logprobs: null,
+          finish_reason: "stop"
+        }],
+        created: Math.floor(Date.now()/1000),
+        model,
+        object: "chat.completion",
+        usage: transformUsage(data.usageMetadata)
+      });
+    }
+    
     // 检查candidates是否存在
     if (!data.candidates) {
       console.error("[ERROR] Gemini API返回的数据中缺少candidates字段");
@@ -611,21 +638,38 @@ async function parseStreamFlush (controller) {
 }
 
 function transformResponseStream (data, stop, first) {
-  const item = transformCandidatesDelta(data.candidates[0]);
-  if (stop) { item.delta = {}; } else { item.finish_reason = null; }
-  if (first) { item.delta.content = ""; } else { delete item.delta.role; }
-  const output = {
-    id: this.id,
-    choices: [item],
-    created: Math.floor(Date.now()/1000),
-    model: this.model,
-    //system_fingerprint: "fp_69829325d0",
-    object: "chat.completion.chunk",
-  };
-  if (data.usageMetadata && this.streamIncludeUsage) {
-    output.usage = stop ? transformUsage(data.usageMetadata) : null;
+  try {
+    const item = transformCandidatesDelta(data.candidates[0]);
+    
+    // 检查是否为错误消息，且是否应该忽略
+    if (item.finish_reason === "error" && !stop && !first) {
+      // 对于中间出现的错误，不将其添加到流中
+      console.error("[WARN] 忽略流中间出现的错误消息，避免污染内容");
+      return null; // 返回null表示不输出这个消息
+    }
+    
+    if (stop) { item.delta = {}; } else { item.finish_reason = null; }
+    if (first) { item.delta.content = ""; } else { delete item.delta.role; }
+    
+    const output = {
+      id: this.id,
+      choices: [item],
+      created: Math.floor(Date.now()/1000),
+      model: this.model,
+      //system_fingerprint: "fp_69829325d0",
+      object: "chat.completion.chunk",
+    };
+    
+    if (data.usageMetadata && this.streamIncludeUsage) {
+      output.usage = stop ? transformUsage(data.usageMetadata) : null;
+    }
+    
+    return "data: " + JSON.stringify(output) + delimiter;
+  } catch (err) {
+    console.error("[ERROR] 转换流响应时出错:", err);
+    // 对于转换错误，返回null而不是错误消息，避免污染内容
+    return null;
   }
-  return "data: " + JSON.stringify(output) + delimiter;
 }
 const delimiter = "\n\n";
 async function toOpenAiStream (chunk, controller) {
@@ -640,25 +684,51 @@ async function toOpenAiStream (chunk, controller) {
     console.error("[ERROR] 解析流数据行失败:", err);
     console.error("[DEBUG] 原始行数据:", line);
     
-    // 创建一个表示错误的候选项
-    const length = this.last.length || 1; // at least 1 error msg
-    const candidates = Array.from({ length }, (_, index) => ({
+    // 判断当前是否已经有内容在输出
+    if (this.last.length > 0) {
+      // 如果已经有内容在输出，则不插入错误消息，避免破坏内容
+      console.error("[WARN] 已有内容输出，跳过错误消息插入");
+      return;
+    }
+    
+    // 创建一个表示错误的候选项，但使用空内容避免污染输出
+    const candidates = [{
       finishReason: "error",
-      content: { parts: [{ text: "解析流响应时出错" }] },
-      index,
-    }));
+      content: { parts: [{ text: "" }] },
+      index: 0,
+    }];
     data = { candidates };
   }
   
+  // 检查是否为ping消息
+  if (!data.candidates && data.usageMetadata && 
+      data.modelVersion && 
+      data.usageMetadata.promptTokenCount <= 5) {
+    console.log("[INFO] 检测到流式ping消息");
+    
+    // 为ping消息创建一个特殊候选项
+    data.candidates = [{
+      finishReason: "stop",
+      content: { parts: [{ text: "pong" }] },
+      index: 0,
+    }];
+  }
   // 检查candidates是否存在且为数组
-  if (!data.candidates || !Array.isArray(data.candidates)) {
+  else if (!data.candidates || !Array.isArray(data.candidates)) {
     console.error("[ERROR] 流响应中缺少candidates数组或格式不正确");
     console.error("[DEBUG] 响应数据:", JSON.stringify(data));
     
-    // 创建一个有效的candidates数组
+    // 判断当前是否已经有内容在输出
+    if (this.last.length > 0) {
+      // 如果已经有内容在输出，则不插入错误消息，避免破坏内容
+      console.error("[WARN] 已有内容输出，跳过错误消息插入");
+      return;
+    }
+    
+    // 创建一个有效的candidates数组，但使用空内容避免污染输出
     data.candidates = [{
       finishReason: "error",
-      content: { parts: [{ text: "API返回了异常数据结构" }] },
+      content: { parts: [{ text: "" }] },
       index: 0,
     }];
   }
@@ -668,10 +738,17 @@ async function toOpenAiStream (chunk, controller) {
     console.error("[ERROR] 流响应中candidates是空数组");
     console.error("[DEBUG] 响应数据:", JSON.stringify(data));
     
-    // 添加一个默认候选项
+    // 判断当前是否已经有内容在输出
+    if (this.last.length > 0) {
+      // 如果已经有内容在输出，则不插入错误消息，避免破坏内容
+      console.error("[WARN] 已有内容输出，跳过错误消息插入");
+      return;
+    }
+    
+    // 添加一个默认候选项，但使用空内容避免污染输出
     data.candidates = [{
       finishReason: "error",
-      content: { parts: [{ text: "API返回了空的候选项列表" }] },
+      content: { parts: [{ text: "" }] },
       index: 0,
     }];
   }
@@ -683,14 +760,20 @@ async function toOpenAiStream (chunk, controller) {
     cand.index = cand.index || 0; // absent in new -002 models response
     
     if (!this.last[cand.index]) {
-      controller.enqueue(transform(data, false, "first"));
+      const result = transform(data, false, "first");
+      if (result) { // 只有在transform返回有效内容时才发送
+        controller.enqueue(result);
+      }
     }
     
     this.last[cand.index] = data;
     
     // 检查content是否存在
     if (cand.content) {
-      controller.enqueue(transform(data));
+      const result = transform(data);
+      if (result) { // 只有在transform返回有效内容时才发送
+        controller.enqueue(result);
+      }
     } else {
       console.error("[ERROR] 候选项缺少content字段");
       console.error("[DEBUG] 候选项内容:", JSON.stringify(cand));
@@ -700,23 +783,36 @@ async function toOpenAiStream (chunk, controller) {
     console.error("[ERROR] 处理流数据时出错:", err);
     console.error("[DEBUG] 尝试处理的数据:", JSON.stringify(data));
     
-    // 替换为错误候选项
+    // 判断当前是否已经有内容在输出
+    if (this.last.length > 0) {
+      // 如果已经有内容在输出，则不插入错误消息，避免破坏内容
+      console.error("[WARN] 已有内容输出，跳过错误消息插入");
+      return;
+    }
+    
+    // 替换为错误候选项，但使用空内容避免污染输出
     const errorData = {
       candidates: [{
         finishReason: "error",
-        content: { parts: [{ text: "处理流数据时出错" }] },
+        content: { parts: [{ text: "" }] },
         index: 0,
       }]
     };
     this.last = [errorData];
-    controller.enqueue(transform(errorData, false, "first"));
+    const result = transform(errorData, false, "first");
+    if (result) { // 只有在transform返回有效内容时才发送
+      controller.enqueue(result);
+    }
   }
 }
 async function toOpenAiStreamFlush (controller) {
   const transform = transformResponseStream.bind(this);
   if (this.last.length > 0) {
     for (const data of this.last) {
-      controller.enqueue(transform(data, "stop"));
+      const result = transform(data, "stop");
+      if (result) { // 只有在transform返回有效内容时才发送
+        controller.enqueue(result);
+      }
     }
     controller.enqueue("data: [DONE]" + delimiter);
   }
