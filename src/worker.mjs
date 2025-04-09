@@ -71,8 +71,6 @@ const API_VERSION = "v1beta";
 const API_CLIENT = "genai-js/0.21.0"; // npm view @google/generative-ai version
 const makeHeaders = (apiKey, more) => ({
   "x-goog-api-client": API_CLIENT,
-  "Accept-Encoding": "gzip, deflate",
-  "Accept": "*/*",
   ...(apiKey && { "x-goog-api-key": apiKey }),
   ...more
 });
@@ -245,12 +243,7 @@ const parseImg = async (url) => {
   let mimeType, data;
   if (url.startsWith("http://") || url.startsWith("https://")) {
     try {
-      const response = await fetch(url, {
-        headers: {
-          "Accept-Encoding": "gzip, deflate",
-          "Accept": "*/*"
-        }
-      });
+      const response = await fetch(url);
       if (!response.ok) {
         throw new Error(`${response.status} ${response.statusText} (${url})`);
       }
